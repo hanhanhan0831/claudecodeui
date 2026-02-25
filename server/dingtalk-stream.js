@@ -1,5 +1,6 @@
 import { DWClient, EventAck, TOPIC_ROBOT } from 'dingtalk-stream';
 import crypto from 'crypto';
+import fetch from 'node-fetch';
 import { dingtalkDb } from './database/db.js';
 import { queryClaudeSDK } from './claude-sdk.js';
 import { getProjects } from './projects.js';
@@ -84,6 +85,84 @@ export async function getAccessToken(clientId, clientSecret) {
   cachedAccessToken = data.accessToken;
   tokenExpiresAt = now + ((data.expireIn || 7200) - 300) * 1000;
   return cachedAccessToken;
+}
+
+// ==================== Image Download ====================
+
+/**
+ * Download a media file from DingTalk using downloadCode and return as base64 data URL.
+ */
+async function downloadDingTalkImage(downloadCode, accessToken) {
+  try {
+    const res = await fetch('https://api.dingtalk.com/v1.0/robot/messageFiles/download', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-acs-dingtalk-access-token': accessToken,
+      },
+      body: JSON.stringify({ downloadCode, robotCode: activeConfig?.client_id }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error(`[DingTalk] Failed to download image (${res.status}): ${errText}`);
+      return null;
+    }
+
+    const data = await res.json();
+    const downloadUrl = data?.downloadUrl;
+    if (!downloadUrl) {
+      console.error('[DingTalk] No downloadUrl in response');
+      return null;
+    }
+
+    // Download the actual image binary
+    const imgRes = await fetch(downloadUrl);
+    if (!imgRes.ok) {
+      console.error(`[DingTalk] Failed to fetch image from URL (${imgRes.status})`);
+      return null;
+    }
+
+    const buffer = await imgRes.buffer();
+    const contentType = imgRes.headers.get('content-type') || 'image/png';
+    const base64 = buffer.toString('base64');
+    return `data:${contentType};base64,${base64}`;
+  } catch (err) {
+    console.error('[DingTalk] Error downloading image:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Extract image downloadCodes from DingTalk robot message data.
+ * DingTalk may include images in richText array or as pictureDownloadCode.
+ */
+function extractImageDownloadCodes(data) {
+  const codes = [];
+
+  // richText content (common for mixed text+image messages)
+  if (data?.content?.richText) {
+    for (const item of data.content.richText) {
+      if (item?.pictureDownloadCode) {
+        codes.push(item.pictureDownloadCode);
+      }
+      if (item?.downloadCode) {
+        codes.push(item.downloadCode);
+      }
+    }
+  }
+
+  // Top-level pictureDownloadCode (single image messages)
+  if (data?.pictureDownloadCode) {
+    codes.push(data.pictureDownloadCode);
+  }
+
+  // imageContent (some message formats)
+  if (data?.imageContent?.downloadCode) {
+    codes.push(data.imageContent.downloadCode);
+  }
+
+  return codes;
 }
 
 // ==================== DingTalkCardWriter ====================
@@ -402,7 +481,7 @@ function buildOpenSpaceId(conversationType, conversationId, senderStaffId) {
 
 // ==================== Process with Claude ====================
 
-async function processWithClaude({ userMessage, conv, accessToken, config }) {
+async function processWithClaude({ userMessage, conv, accessToken, config, images }) {
   const outTrackId = `claude_${conv.id}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const openSpaceId = buildOpenSpaceId(conv.conversation_type, conv.dingtalk_conversation_id, conv.sender_staff_id);
 
@@ -444,6 +523,7 @@ async function processWithClaude({ userMessage, conv, accessToken, config }) {
       cwd: conv.project_path,
       sessionId: conv.claude_session_id || null,
       permissionMode: conv.permission_mode || 'bypassPermissions',
+      images: images && images.length > 0 ? images : undefined,
     }, writer);
 
     const newSessionId = writer.getSessionId();
@@ -654,7 +734,16 @@ async function handleRobotMessage(data) {
     const conversationId = data?.conversationId;
     const conversationType = data?.conversationType || '1';
 
-    if (!senderStaffId || !conversationId || !textContent) {
+    // Extract image download codes from the message
+    const imageDownloadCodes = extractImageDownloadCodes(data);
+    const hasImages = imageDownloadCodes.length > 0;
+
+    if (!textContent && !hasImages) {
+      // Log the raw data keys to help debug unrecognized message types
+      console.log('[DingTalk] Message has no text and no recognized images. Keys:', Object.keys(data || {}).join(', '));
+    }
+
+    if (!senderStaffId || !conversationId || (!textContent && !hasImages)) {
       console.log('[DingTalk] Ignoring empty or invalid message');
       return;
     }
@@ -667,7 +756,7 @@ async function handleRobotMessage(data) {
     if (conversationType === '2') {
       userMessage = userMessage.replace(/^@\S+\s*/, '').trim();
     }
-    if (!userMessage) return;
+    if (!userMessage && !hasImages) return;
 
     const config = activeConfig || dingtalkDb.getActiveConfig();
     if (!config) {
@@ -773,13 +862,26 @@ async function handleRobotMessage(data) {
 
     // Case A: No active session — need project selection
     if (!conv.project_path) {
-      dingtalkDb.setPendingMessage(conv.id, userMessage);
+      dingtalkDb.setPendingMessage(conv.id, userMessage || '(image)');
       await sendProjectList({ accessToken, config, conv });
       return;
     }
 
+    // Download images if present
+    let images = [];
+    if (hasImages) {
+      console.log(`[DingTalk] Downloading ${imageDownloadCodes.length} image(s)...`);
+      const results = await Promise.all(
+        imageDownloadCodes.map(code => downloadDingTalkImage(code, accessToken))
+      );
+      images = results
+        .filter(Boolean)
+        .map(dataUrl => ({ data: dataUrl }));
+      console.log(`[DingTalk] Successfully downloaded ${images.length} image(s)`);
+    }
+
     // Case B: Active session — process directly
-    await processWithClaude({ userMessage, conv, accessToken, config });
+    await processWithClaude({ userMessage: userMessage || '请查看图片', conv, accessToken, config, images });
   } catch (err) {
     console.error('[DingTalk] handleRobotMessage error:', err);
   }
